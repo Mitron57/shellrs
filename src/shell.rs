@@ -21,6 +21,7 @@ use std::slice::Iter;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
+#[derive(Debug)]
 pub struct Shell {
     username: String,
     hostname: String,
@@ -275,32 +276,29 @@ impl Shell {
         Ok(())
     }
 
-    fn cd(&mut self, cmd: &str, args: &mut [String]) -> Result<(), Box<dyn Error>> {
-        let path_idx = args
-            .iter()
-            .position(|arg| !arg.starts_with('-'))
-            .unwrap_or(args.len());
-        if let Some(path) = args.get_mut(path_idx) {
-            *path = self.parse_path(path);
+    fn cd(&mut self, args: &mut [String]) -> Result<(), Box<dyn Error>> {
+        if args.is_empty() {
+            self.working_directory = self.home.clone();
+            self.exit_status = 0;
+            return Ok(());
         }
-        match self.launch_command(cmd, args, (None, None)) {
-            Ok(_) => {
-                if self.exit_status == 0 {
-                    self.working_directory = if path_idx == args.len() {
-                        self.home.clone()
-                    } else {
-                        args[path_idx].clone()
-                    }
-                }
-                Ok(())
-            }
-            Err(error) => Err(error),
+        let path = self.parse_path(&args[0]);
+        let os_path = std::path::Path::new(&path);
+        if os_path.exists() && os_path.is_dir() {
+            self.working_directory = path;
+            self.exit_status = 0;
+            return Ok(());
         }
+        self.exit_status = 1;
+        if !os_path.exists() {
+            return Err(format!("cd: no such file or directory: {}", path).into());
+        }
+        Err(format!("cd: not a directory: {}", path).into())
     }
 
     fn operate_command(&mut self, cmd: &str, args: &mut [String]) -> Result<(), Box<dyn Error>> {
         match cmd {
-            "cd" => self.cd(cmd, args),
+            "cd" => self.cd(args),
             "pwd" => {
                 println!("{}", self.working_directory);
                 Ok(())
