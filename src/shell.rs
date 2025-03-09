@@ -3,7 +3,7 @@ use nix::libc;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
-use nix::unistd::{close, dup2, fork, ForkResult};
+use nix::unistd::{close, dup2, fork, pipe, ForkResult};
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
     iterator::Signals,
@@ -17,6 +17,7 @@ use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::slice::Iter;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
@@ -46,7 +47,7 @@ impl Shell {
             #[cfg(target_os = "macos")]
             hostname: gethostname().replace(".local", ""),
             #[cfg(target_os = "linux")]
-            hostname: gethostname(),
+            hostname: gethostname().trim().to_owned(),
             home: std::env::var("HOME").unwrap(),
             working_directory: std::env::current_dir()
                 .unwrap()
@@ -65,7 +66,8 @@ impl Shell {
         if path.is_empty() {
             return path.to_string();
         }
-        let mut path_stack = VecDeque::new();
+        let split: Vec<&str> = path.split('/').collect();
+        let mut path_stack = VecDeque::with_capacity(split.len());
         let mut parsed: VecDeque<&str> = if path.starts_with('/') {
             VecDeque::new()
         } else {
@@ -74,7 +76,7 @@ impl Shell {
                 .filter(|&part| !part.is_empty())
                 .collect()
         };
-        for part in path.split('/') {
+        for part in split {
             if part.is_empty() {
                 continue;
             }
@@ -107,44 +109,60 @@ impl Shell {
         }
     }
 
+    fn parse_quotes(&self, arg: &str, args_iter: &mut Iter<String>, args: &mut Vec<String>) {
+        let mut arg = arg.strip_prefix('"').unwrap().to_owned();
+        if arg.ends_with('"') {
+            arg = arg.strip_suffix('"').unwrap().to_owned();
+        } else {
+            for part in args_iter {
+                let mut part = part.to_string();
+                if part.ends_with('"') {
+                    part = part.strip_suffix('"').unwrap().to_owned();
+                }
+                part = self.interpolate_env_variable(&part).unwrap_or(part);
+                arg.push_str(&format!(" {part}"));
+            }
+        }
+        args.push(arg);
+    }
+
+    fn parse_backslashes(&self, part: &str, args_iter: &mut Iter<String>, args: &mut Vec<String>) {
+        let mut combined = part.strip_suffix('\\').unwrap().to_owned();
+        if let Some(arg) = args_iter.next() {
+            let arg = self.interpolate_env_variable(arg).unwrap_or_default();
+            combined.push_str(&format!(" {arg}"));
+        }
+        args.push(combined);
+    }
+
+    fn parse_envs(&self, arg: &str) -> String {
+        match arg.split_once('$') {
+            Some((before, after)) => {
+                let after = "$".to_owned() + after;
+                before.to_owned() + &self.interpolate_env_variable(&after).unwrap_or(after)
+            }
+            None => arg.to_owned(),
+        }
+    }
+
     fn parse_input(&self, input: &str) -> Result<(String, Vec<String>), Box<dyn Error>> {
         if input.is_empty() {
             return Ok((String::new(), Vec::new()));
         }
+
         let parts: Vec<String> = input.split_whitespace().map(str::to_owned).collect();
         let (cmd, args) = parts.split_first().unwrap();
+
         let mut args_iter = args.iter();
         let mut args = Vec::with_capacity(args.len());
+
         while let Some(part) = args_iter.next() {
-            let part = match part.split_once('$') {
-                Some((before, after)) => {
-                    let after = "$".to_owned() + after;
-                    before.to_owned() + &self.interpolate_env_variable(&after).unwrap_or(after)
-                }
-                None => part.to_owned(),
-            };
+            let part = self.parse_envs(part);
+
             if part.starts_with('"') {
-                let mut arg = part.strip_prefix('"').unwrap().to_owned();
-                if arg.ends_with('"') {
-                    arg = arg.strip_suffix('"').unwrap().to_owned();
-                } else {
-                    for part in args_iter.by_ref() {
-                        let mut part = part.to_string();
-                        if part.ends_with('"') {
-                            part = part.strip_suffix('"').unwrap().to_owned();
-                        }
-                        part = self.interpolate_env_variable(&part).unwrap_or(part);
-                        arg.push_str(&format!(" {part}"));
-                    }
-                }
-                args.push(arg);
+                self.parse_quotes(&part, &mut args_iter, &mut args);
             } else if part.ends_with('\\') {
-                let mut combined = part.strip_suffix('\\').unwrap().to_owned();
-                if let Some(arg) = args_iter.next() {
-                    let arg = self.interpolate_env_variable(arg).unwrap_or_default();
-                    combined.push_str(&format!(" {arg}"));
-                }
-                args.push(combined);
+                self.parse_backslashes(&part, &mut args_iter, &mut args);
             } else {
                 let part = part.to_owned();
                 match part.split_once('*') {
@@ -177,11 +195,20 @@ impl Shell {
         Ok((cmd.clone(), args))
     }
 
+    fn exec_child(&mut self, command: &str, args: &[String]) -> ! {
+        let err = Command::new(command)
+            .args(args)
+            .current_dir(&self.working_directory)
+            .exec();
+        println!("{command}: {err}");
+        std::process::exit(127)
+    }
+
     fn launch_command(
         &mut self,
         command: &str,
         args: &[String],
-        other_input: (Option<RawFd>, Option<RawFd>),
+        fds: (Option<RawFd>, Option<RawFd>),
     ) -> Result<(), Box<dyn Error>> {
         let fork = unsafe { fork() };
         match fork {
@@ -204,31 +231,15 @@ impl Shell {
                 }
             },
             Ok(ForkResult::Child) => {
-                match other_input {
-                    (Some(input), Some(output)) => {
-                        close(libc::STDIN_FILENO)?;
-                        close(libc::STDOUT_FILENO)?;
-                        dup2(input, libc::STDIN_FILENO)?;
-                        dup2(output, libc::STDOUT_FILENO)?;
-                    }
-                    (Some(input), None) => {
-                        close(libc::STDIN_FILENO)?;
-                        dup2(input, libc::STDIN_FILENO)?;
-                    }
-                    (None, Some(output)) => {
-                        close(libc::STDOUT_FILENO)?;
-                        dup2(output, libc::STDOUT_FILENO)?;
-                    }
-                    _ => {}
+                if let Some(read) = fds.0 {
+                    dup2(read, libc::STDIN_FILENO)?;
+                    close(read)?;
                 }
-                let err = Command::new(command)
-                    .args(args)
-                    .current_dir(&self.working_directory)
-                    .exec();
-                let _ = self
-                    .stdout
-                    .write(format!("{}: {}\n", command, err).as_bytes());
-                std::process::exit(127)
+                if let Some(write) = fds.1 {
+                    dup2(write, libc::STDOUT_FILENO)?;
+                    close(write)?;
+                }
+                self.exec_child(command, args)
             }
             Err(_) => Err("fork failed".into()),
         }
@@ -238,102 +249,58 @@ impl Shell {
         &mut self,
         commands: Vec<(String, Vec<String>)>,
     ) -> Result<(), Box<dyn Error>> {
-        let mut prev_pipe = None;
+        let mut prev_pipe: Option<(_, _)> = None;
         for (i, (command, args)) in commands.iter().enumerate() {
             let pipe = if i < commands.len() - 1 {
-                let (read, write) = nix::unistd::pipe()?;
+                let (read, write) = pipe()?;
                 Some((read.into_raw_fd(), write.into_raw_fd()))
             } else {
                 None
             };
-            let fork = unsafe { fork() };
-            match fork {
-                Ok(ForkResult::Parent { child }) => {
-                    loop {
-                        if let Ok(signal) = self.shotgun.recv_timeout(Duration::from_millis(10)) {
-                            signal::kill(child, Some(Signal::try_from(signal)?))?;
-                            self.exit_status = signal;
-                            if let Some((read, write)) = prev_pipe {
-                                close(read)?;
-                                close(write)?;
-                            }
-                            if let Some((read, write)) = pipe {
-                                close(read)?;
-                                close(write)?;
-                            }
-                            return Ok(());
-                        }
-                        match nix::sys::wait::waitpid(
-                            child,
-                            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-                        )? {
-                            WaitStatus::Exited(_, code) => {
-                                self.exit_status = code;
-                                break;
-                            }
-                            WaitStatus::Signaled(_, signal, _) => {
-                                self.exit_status = signal as i32;
-                                break;
-                            }
-                            _ => continue,
-                        }
-                    }
-                    if let Some((read, _)) = prev_pipe {
-                        close(read)?;
-                    }
-                    if let Some((_, write)) = pipe {
-                        close(write)?;
-                    }
-                    prev_pipe = pipe;
-                }
-                Ok(ForkResult::Child) => {
-                    if let Some((read, _)) = prev_pipe {
-                        dup2(read, libc::STDIN_FILENO)?;
-                        close(read)?;
-                    }
-                    if let Some((_, write)) = pipe {
-                        dup2(write, libc::STDOUT_FILENO)?;
-                        close(write)?;
-                    }
-                    let err = Command::new(command)
-                        .args(args)
-                        .current_dir(&self.working_directory)
-                        .exec();
-                    let _ = self
-                        .stdout
-                        .write(format!("{}: {}\n", command, err).as_bytes());
-                    std::process::exit(127);
-                }
-                Err(e) => return Err(e.into()),
+            let fds = match (prev_pipe, pipe) {
+                (Some(prev), Some(next)) => (Some(prev.0), Some(next.1)),
+                (Some(prev), None) => (Some(prev.0), None),
+                (None, Some(next)) => (None, Some(next.1)),
+                _ => (None, None),
+            };
+            self.launch_command(command, args, fds)?;
+            if let Some(read) = fds.0 {
+                close(read)?;
             }
+            if let Some(write) = fds.1 {
+                close(write)?;
+            }
+            prev_pipe = pipe;
         }
         Ok(())
     }
 
+    fn cd(&mut self, cmd: &str, args: &mut [String]) -> Result<(), Box<dyn Error>> {
+        let path_idx = args
+            .iter()
+            .position(|arg| !arg.starts_with('-'))
+            .unwrap_or(args.len());
+        if let Some(path) = args.get_mut(path_idx) {
+            *path = self.parse_path(path);
+        }
+        match self.launch_command(cmd, args, (None, None)) {
+            Ok(_) => {
+                if self.exit_status == 0 {
+                    self.working_directory = if path_idx == args.len() {
+                        self.home.clone()
+                    } else {
+                        args[path_idx].clone()
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn operate_command(&mut self, cmd: &str, args: &mut [String]) -> Result<(), Box<dyn Error>> {
         match cmd {
-            "cd" => {
-                let path_idx = args
-                    .iter()
-                    .position(|arg| !arg.starts_with('-'))
-                    .unwrap_or(args.len());
-                if let Some(path) = args.get_mut(path_idx) {
-                    *path = self.parse_path(path);
-                }
-                match self.launch_command(cmd, args, (None, None)) {
-                    Ok(_) => {
-                        if self.exit_status == 0 {
-                            self.working_directory = if path_idx == args.len() {
-                                self.home.clone()
-                            } else {
-                                args[path_idx].clone()
-                            }
-                        }
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                }
-            }
+            "cd" => self.cd(cmd, args),
             "pwd" => {
                 println!("{}", self.working_directory);
                 Ok(())
@@ -353,21 +320,26 @@ impl Shell {
                     } else {
                         &String::new()
                     };
-                    if arg == ">" {
-                        let file = std::fs::File::create(next)?;
-                        descriptors.1 = Some(file.into_raw_fd());
-                    } else if arg == ">>" {
-                        let file = OpenOptions::new()
-                            .create(true)
-                            .truncate(false)
-                            .append(true)
-                            .open(next)?;
-                        descriptors.1 = Some(file.into_raw_fd());
-                    } else if arg == "<" {
-                        let file = std::fs::File::open(next)?;
-                        descriptors.0 = Some(file.into_raw_fd());
-                    } else {
-                        parsed.push(arg.to_string());
+                    match arg.as_str() {
+                        ">" => {
+                            let file = std::fs::File::create(next)?;
+                            descriptors.1 = Some(file.into_raw_fd());
+                        }
+                        ">>" => {
+                            let file = OpenOptions::new()
+                                .create(true)
+                                .truncate(false)
+                                .append(true)
+                                .open(next)?;
+                            descriptors.1 = Some(file.into_raw_fd());
+                        }
+                        "<" => {
+                            let file = std::fs::File::open(next)?;
+                            descriptors.0 = Some(file.into_raw_fd());
+                        }
+                        _ => {
+                            parsed.push(arg.to_string());
+                        }
                     }
                 }
                 self.launch_command(cmd, &parsed, descriptors)?;
@@ -376,11 +348,15 @@ impl Shell {
         }
     }
 
+    fn show_working_directory(&mut self) {
+        let wd = self.working_directory.replace(&self.home, "~");
+        print!("{}@{} {} % ", self.username, self.hostname, wd);
+        self.stdout.flush().unwrap();
+    }
+
     pub fn listen_to_stdin(&mut self) {
         loop {
-            let wd = self.working_directory.replace(&self.home, "~");
-            print!("{}@{} {} % ", self.username, self.hostname, wd);
-            self.stdout.flush().unwrap();
+            self.show_working_directory();
             if let Err(e) = self.stdin.read_line(&mut self.input) {
                 if e.kind() == ErrorKind::UnexpectedEof {
                     return;
@@ -429,7 +405,7 @@ impl Shell {
                             continue;
                         }
                     };
-                    Command::new(cmd)
+                    let _ = Command::new(cmd)
                         .args(args)
                         .current_dir(&self.working_directory)
                         .exec();
