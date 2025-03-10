@@ -110,6 +110,34 @@ impl Shell {
         }
     }
 
+    fn parse_io(
+        &self,
+        arg: &str,
+        next: &str,
+        descriptors: &mut (Option<RawFd>, Option<RawFd>),
+    ) -> Result<(), Box<dyn Error>> {
+        match arg {
+            ">" => {
+                let file = std::fs::File::create(next)?;
+                descriptors.1 = Some(file.into_raw_fd());
+            }
+            ">>" => {
+                let file = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .append(true)
+                    .open(next)?;
+                descriptors.1 = Some(file.into_raw_fd());
+            }
+            "<" => {
+                let file = std::fs::File::open(next)?;
+                descriptors.0 = Some(file.into_raw_fd());
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
     fn parse_quotes(&self, arg: &str, args_iter: &mut Iter<String>, args: &mut Vec<String>) {
         let mut arg = arg.strip_prefix('"').unwrap().to_owned();
         if arg.ends_with('"') {
@@ -159,7 +187,6 @@ impl Shell {
 
         while let Some(part) = args_iter.next() {
             let part = self.parse_envs(part);
-
             if part.starts_with('"') {
                 self.parse_quotes(&part, &mut args_iter, &mut args);
             } else if part.ends_with('\\') {
@@ -296,7 +323,7 @@ impl Shell {
         Err(format!("cd: not a directory: {}", path).into())
     }
 
-    fn operate_command(&mut self, cmd: &str, args: &mut [String]) -> Result<(), Box<dyn Error>> {
+    fn execute(&mut self, cmd: &str, args: &mut [String]) -> Result<(), Box<dyn Error>> {
         match cmd {
             "cd" => self.cd(args),
             "pwd" => {
@@ -308,37 +335,15 @@ impl Shell {
                 let mut parsed = Vec::with_capacity(args.len());
                 let mut args_iter = args.iter().peekable();
                 while let Some(arg) = args_iter.next() {
-                    let next = if arg == ">" || arg == ">>" || arg == "<" {
-                        match args_iter.next() {
+                    if arg == ">" || arg == ">>" || arg == "<" {
+                        let next = match args_iter.next() {
                             Some(next) => next,
-                            None => {
-                                return Err(format!("parse error near {arg}").into());
-                            }
-                        }
-                    } else {
-                        &String::new()
-                    };
-                    match arg.as_str() {
-                        ">" => {
-                            let file = std::fs::File::create(next)?;
-                            descriptors.1 = Some(file.into_raw_fd());
-                        }
-                        ">>" => {
-                            let file = OpenOptions::new()
-                                .create(true)
-                                .truncate(false)
-                                .append(true)
-                                .open(next)?;
-                            descriptors.1 = Some(file.into_raw_fd());
-                        }
-                        "<" => {
-                            let file = std::fs::File::open(next)?;
-                            descriptors.0 = Some(file.into_raw_fd());
-                        }
-                        _ => {
-                            parsed.push(arg.to_string());
-                        }
+                            None => return Err(format!("parse error near {arg}").into()),
+                        };
+                        self.parse_io(arg, next, &mut descriptors)?;
+                        continue;
                     }
+                    parsed.push(arg.clone());
                 }
                 self.launch_command(cmd, &parsed, descriptors)?;
                 Ok(())
@@ -350,6 +355,68 @@ impl Shell {
         let wd = self.working_directory.replace(&self.home, "~");
         print!("{}@{} {} % ", self.username, self.hostname, wd);
         self.stdout.flush().unwrap();
+    }
+
+    fn batch_execute(&mut self) {
+        let input: Vec<String> = self
+            .input
+            .split("&&")
+            .map(str::to_owned)
+            .filter(|part| !part.is_empty())
+            .collect();
+        for shard in input {
+            if shard.contains("|") {
+                self.pipe_execute(&shard);
+                if self.exit_status != 0 {
+                    break;
+                }
+                continue;
+            }
+            let (cmd, mut args) = match self.parse_input(shard.trim()) {
+                Ok(command_line) => command_line,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    continue;
+                }
+            };
+            if cmd == "exec" {
+                self.input = self.input.replace("exec ", "");
+                let (cmd, args) = match self.parse_input(&self.input) {
+                    Ok(command_line) => command_line,
+                    Err(err) => {
+                        eprintln!("Error: {err}");
+                        continue;
+                    }
+                };
+                let _ = Command::new(cmd)
+                    .args(args)
+                    .current_dir(&self.working_directory)
+                    .exec();
+            }
+            if let Err(err) = self.execute(&cmd, &mut args) {
+                eprintln!("Error: {err}");
+            }
+            if self.exit_status != 0 {
+                break;
+            }
+        }
+        self.input.clear();
+    }
+
+    fn pipe_execute(&mut self, shard: &str) {
+        let commands: Vec<_> = shard
+            .split("|")
+            .map(|part| {
+                self.parse_input(part).unwrap_or_else(|err| {
+                    eprintln!("Error: {err}");
+                    (String::new(), Vec::new())
+                })
+            })
+            .filter(|(cmd, _)| !cmd.is_empty())
+            .collect();
+        if let Err(err) = self.launch_command_piped(commands) {
+            eprintln!("Error: {err}");
+        }
     }
 
     pub fn listen_to_stdin(&mut self) {
@@ -367,51 +434,7 @@ impl Shell {
             if self.input == "exit" {
                 return;
             }
-            let input: Vec<_> = self.input.split("&&").map(str::to_owned).collect();
-            for shard in input {
-                if shard.contains('|') {
-                    let commands: Vec<_> = self
-                        .input
-                        .split('|')
-                        .map(|part| {
-                            self.parse_input(part.trim()).unwrap_or_else(|err| {
-                                eprintln!("Error: {err}");
-                                (String::new(), Vec::new())
-                            })
-                        })
-                        .filter(|(cmd, _)| !cmd.is_empty())
-                        .collect();
-                    if let Err(e) = self.launch_command_piped(commands) {
-                        eprintln!("Error: {}", e);
-                    }
-                    self.input.clear();
-                    continue;
-                }
-                let (cmd, mut args) = match self.parse_input(shard.trim()) {
-                    Ok(command_line) => command_line,
-                    Err(err) => {
-                        eprintln!("Error: {err}");
-                        continue;
-                    }
-                };
-                if cmd == "exec" {
-                    self.input = self.input.replace("exec ", "");
-                    let (cmd, args) = match self.parse_input(&self.input) {
-                        Ok(command_line) => command_line,
-                        Err(err) => {
-                            eprintln!("Error: {err}");
-                            continue;
-                        }
-                    };
-                    let _ = Command::new(cmd)
-                        .args(args)
-                        .current_dir(&self.working_directory)
-                        .exec();
-                }
-                if let Err(err) = self.operate_command(&cmd, &mut args) {
-                    eprintln!("Error: {err}");
-                }
-            }
+            self.batch_execute();
             self.input.clear();
         }
     }
