@@ -20,6 +20,7 @@ use std::process::Command;
 use std::slice::Iter;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
+use libc::SIGKILL;
 
 #[derive(Debug)]
 pub struct Shell {
@@ -38,7 +39,7 @@ impl Shell {
     pub fn new() -> Shell {
         let (sender, shotgun) = channel();
         std::thread::spawn(move || {
-            let mut signals = Signals::new([SIGINT, SIGTERM]).unwrap();
+            let mut signals = Signals::new([SIGINT, SIGTERM, SIGKILL]).unwrap();
             for signal in signals.forever() {
                 sender.send(signal).unwrap();
             }

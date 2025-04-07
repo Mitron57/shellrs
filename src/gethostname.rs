@@ -4,7 +4,7 @@ pub fn gethostname() -> String {
     unsafe {
         libc::gethostname(name_ptr, 255);
         let len = libc::strlen(name_ptr);
-        name.set_len(len);
+        name.resize(len, 0);
         String::from_utf8_unchecked(name)
     }
 }
